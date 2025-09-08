@@ -1,0 +1,131 @@
+BTC-USD — Regime Periods (TRAIN 2014–2018)
+==========================================
+
+[001] Bull
+     Period : 2015-04-05 -> 2015-04-08  (4 days)
+     Return : -3.42%
+
+[002] Bear
+     Period : 2015-04-09 -> 2015-04-25  (17 days)
+     Return : -7.60%
+
+[003] Choppy
+     Period : 2015-04-26 -> 2015-07-04  (70 days)
+     Return : +15.24%
+
+[004] Bull
+     Period : 2015-07-05 -> 2015-08-07  (34 days)
+     Return : +7.17%
+
+[005] Bear
+     Period : 2015-08-08 -> 2015-09-22  (46 days)
+     Return : -17.51%
+
+[006] Choppy
+     Period : 2015-09-23 -> 2015-10-15  (23 days)
+     Return : +10.28%
+
+[007] Bull
+     Period : 2015-10-16 -> 2016-03-11  (148 days)
+     Return : +65.81%
+
+[008] Choppy
+     Period : 2016-03-12 -> 2016-03-26  (15 days)
+     Return : -0.89%
+
+[009] Bull
+     Period : 2016-03-27 -> 2016-04-06  (11 days)
+     Return : +1.31%
+
+[010] Choppy
+     Period : 2016-04-07 -> 2016-04-19  (13 days)
+     Return : +2.86%
+
+[011] Bull
+     Period : 2016-04-20 -> 2016-08-30  (133 days)
+     Return : +32.60%
+
+[012] Choppy
+     Period : 2016-08-31 -> 2016-09-07  (8 days)
+     Return : +6.41%
+
+[013] Bull
+     Period : 2016-09-08 -> 2016-10-01  (24 days)
+     Return : -0.09%
+
+[014] Choppy
+     Period : 2016-10-02 -> 2016-10-10  (9 days)
+     Return : +0.82%
+
+[015] Bull
+     Period : 2016-10-11 -> 2018-02-01  (479 days)
+     Return : +1381.52%
+
+[016] Bear
+     Period : 2018-02-02 -> 2018-03-12  (39 days)
+     Return : +0.38%
+
+[017] Choppy
+     Period : 2018-03-13 -> 2018-03-21  (9 days)
+     Return : -3.00%
+
+[018] Bear
+     Period : 2018-03-22 -> 2018-04-01  (11 days)
+     Return : -23.35%
+
+[019] Choppy
+     Period : 2018-04-02 -> 2018-04-11  (10 days)
+     Return : +1.81%
+
+[020] Bear
+     Period : 2018-04-12 -> 2018-04-19  (8 days)
+     Return : +19.03%
+
+[021] Bull
+     Period : 2018-04-20 -> 2018-05-10  (21 days)
+     Return : +9.04%
+
+[022] Bear
+     Period : 2018-05-11 -> 2018-05-21  (11 days)
+     Return : -6.91%
+
+[023] Choppy
+     Period : 2018-05-22 -> 2018-05-30  (9 days)
+     Return : -12.03%
+
+[024] Bear
+     Period : 2018-05-31 -> 2018-06-07  (8 days)
+     Return : +3.67%
+
+[025] Choppy
+     Period : 2018-06-08 -> 2018-06-22  (15 days)
+     Return : -20.77%
+
+[026] Bear
+     Period : 2018-06-23 -> 2018-07-23  (31 days)
+     Return : +26.75%
+
+[027] Bull
+     Period : 2018-07-24 -> 2018-08-07  (15 days)
+     Return : -12.42%
+
+[028] Bear
+     Period : 2018-08-08 -> 2018-10-01  (55 days)
+     Return : -2.42%
+
+[029] Choppy
+     Period : 2018-10-02 -> 2018-10-28  (27 days)
+     Return : -1.57%
+
+[030] Bear
+     Period : 2018-10-29 -> 2018-11-10  (13 days)
+     Return : -1.19%
+
+[031] Choppy
+     Period : 2018-11-11 -> 2018-11-14  (4 days)
+     Return : -10.47%
+
+[032] Bear
+     Period : 2018-11-15 -> 2018-12-31  (47 days)
+     Return : -34.78%
+
