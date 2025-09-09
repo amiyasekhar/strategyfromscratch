@@ -2,10 +2,10 @@
 # BTC-USD (Yahoo Finance) — Train 2014-01-01..2018-12-31,
 #                           Test  2019-01-01..2025-12-31
 # Regime classification via 3-state GaussianHMM
-# - Causal decoding (no look-ahead, no future returns)
-# - State→label mapping frozen from TRAIN sample only
+# - Causal decoding (no look-ahead into TEST)
+# - STATE→LABEL mapping from TRAIN forward returns (H_MAP days)
 # - Guardrails & choppy detection (no future peeking)
-# - Debounce stickiness (7–10d), Weekly overlay confirmation
+# - Debounce stickiness (7–10d), **NO WEEKLY GATING**
 # - Adaptive thresholds (vol-aware ADX/RSI/drift)
 # - Writes CSV + two TXT summaries of contiguous regime periods
 # =============================================================
@@ -26,12 +26,16 @@ TEST_END    = "2025-12-31"   # or None for latest
 N_STATES    = 3
 SEED        = 42
 
+# >>> Mapping choice
+MAP_USING_FORWARD = True   # use TRAIN forward returns to define Bull/Bear/Choppy
+H_MAP             = 5      # horizon (days) for forward mapping if MAP_USING_FORWARD=True
+
 # Decoding stickiness / smoothing (CAUSAL)
 BASE_KAPPA          = 6.0
 ALPHA_CHOPPY        = 1.0
 ALPHA_TREND_LOOSEN  = 1.0
 DEBOUNCE_MIN_RUN    = 10  # offline pretty-pass (not used in RT)
-MIN_PERSIST_DAYS    = 8   # <<< causal stickiness target window (7–10 is good)
+MIN_PERSIST_DAYS    = 8   # causal stickiness target window (raise to 10–12 if needed)
 GUARD_MIN_HOLD      = 5   # guardrail min hold (already causal)
 
 # Guardrails / structure (BASE values; will be ADAPTIVE)
@@ -53,12 +57,6 @@ CHOPPY_ROLL_DAYS        = 120
 CHOPPY_PCTL             = 0.25
 CHOP_ENTER_K            = 3
 CHOP_EXIT_K             = 2
-
-# Multi-resolution overlay (weekly confirmation)
-WEEKLY_ADX_LEN          = 14
-WEEKLY_EWMA_FAST        = 10
-WEEKLY_EWMA_SLOW        = 30
-WEEKLY_CONFIRM_HOLD     = 1   # require this many weekly bars in agreement
 
 CSV_OUT = "btc_usd_regimes_2014train_2019plus_test.csv"
 TXT_TRAIN_OUT = "regime_periods_train_2014_2018.txt"
@@ -237,51 +235,6 @@ def build_features(df):
     return df.copy()
 
 # -------------------
-# Weekly overlay (multi-resolution confirmation)
-# -------------------
-def weekly_overlay(daily):
-    # Build weekly OHLC from daily
-    wk = pd.DataFrame(index=daily.resample('W-FRI').last().index)
-    wk["open"]  = daily["open"].resample('W-FRI').first()
-    wk["high"]  = daily["high"].resample('W-FRI').max()
-    wk["low"]   = daily["low"].resample('W-FRI').min()
-    wk["close"] = daily["close"].resample('W-FRI').last()
-
-    wk["ADXw"]     = adx(wk["high"], wk["low"], wk["close"], WEEKLY_ADX_LEN).fillna(0.0)
-    wk["EWMAw10"]  = ema(wk["close"], WEEKLY_EWMA_FAST)
-    wk["EWMAw30"]  = ema(wk["close"], WEEKLY_EWMA_SLOW)
-
-    # Adaptive weekly ADX cutoff using weekly RealVol proxy
-    wk_ret = np.log(wk["close"]/wk["close"].shift(1))
-    wk["RealVolW"] = wk_ret.rolling(10).std().fillna(0.0)
-    wk["VolPctlW"] = pct_rank(wk["RealVolW"], 104).clip(0,1).fillna(0.0)
-
-    # Dynamic cutoff: base 20 + up to +10 with high vol
-    wk["ADXminDyn"] = GUARD_ADX_MIN_BASE + 10.0*wk["VolPctlW"]
-
-    # Trend direction & strength
-    wk["TrendUp"]   = (wk["close"] > wk["EWMAw30"])
-    wk["TrendDown"] = (wk["close"] < wk["EWMAw30"])
-    wk["Strong"]    = wk["ADXw"] >= wk["ADXminDyn"]
-
-    # Simple weekly validation signals
-    wk["BullConfirm"] = wk["TrendUp"] & wk["Strong"]
-    wk["BearConfirm"] = wk["TrendDown"] & wk["Strong"]
-
-    # Forward-fill back to daily index for alignment
-    d = pd.DataFrame(index=daily.index)
-    d["BullConfirmW"] = wk["BullConfirm"].reindex(d.index, method="ffill").fillna(False)
-    d["BearConfirmW"] = wk["BearConfirm"].reindex(d.index, method="ffill").fillna(False)
-
-    # Require at least WEEKLY_CONFIRM_HOLD consecutive weekly bars true
-    # Convert weekly booleans to daily and then smooth by counting last K weekly closes
-    wk_ok_b = wk["BullConfirm"].rolling(WEEKLY_CONFIRM_HOLD).apply(lambda x: float(np.all(x==1.0)), raw=True).astype(bool)
-    wk_ok_s = wk["BearConfirm"].rolling(WEEKLY_CONFIRM_HOLD).apply(lambda x: float(np.all(x==1.0)), raw=True).astype(bool)
-    d["BullConfirmW"] = wk_ok_b.reindex(d.index, method="ffill").fillna(False)
-    d["BearConfirmW"] = wk_ok_s.reindex(d.index, method="ffill").fillna(False)
-    return d[["BullConfirmW","BearConfirmW"]]
-
-# -------------------
 # HMM & causal decoder
 # -------------------
 def fit_hmm(X, n_states=N_STATES, seed=SEED):
@@ -357,13 +310,62 @@ def decode_causal_dynamic(hmm, X, choppy_score, trend_score):
         states[t] = backptr[t+1, states[t+1]]
     return states
 
-def state_label_mapper_from_train(mu_by_state):
+# -------------------
+# State→Label mapping helpers
+# -------------------
+def forward_logret(series_close, h):
+    return np.log(series_close.shift(-h) / series_close)
+
+def state_label_mapper_from_train_same_day(mu_by_state):
     def label_by_state(s):
         mu = mu_by_state[s]
         if mu < -0.001: return "Bear"
         if mu >  0.0:   return "Bull"
         return "Choppy"
     return label_by_state
+
+def state_label_mapper_from_train_forward(posteriors, close_series, h, state_count):
+    """Map HMM states → {Bull, Bear, Choppy} using TRAIN forward log-returns over horizon h."""
+    if isinstance(close_series, pd.DataFrame):
+        close_1d = close_series.iloc[:, 0]
+    else:
+        close_1d = close_series
+    fwd = np.log(close_1d.shift(-h) / close_1d)
+
+    P_full = np.asarray(posteriors, dtype=float)
+    if P_full.ndim != 2:
+        raise ValueError(f"posteriors must be 2D, got shape {P_full.shape}")
+    if P_full.shape[1] != int(state_count):
+        raise ValueError(f"state_count mismatch: got {state_count}, posteriors has {P_full.shape[1]} columns")
+    if P_full.shape[0] != len(fwd):
+        raise ValueError(f"Row mismatch: posteriors rows {P_full.shape[0]} vs fwd len {len(fwd)}")
+
+    valid = fwd.notna().to_numpy(dtype=bool).reshape(-1)
+    P = P_full[valid]
+    y = fwd.to_numpy(dtype=float).reshape(-1)[valid]
+
+    row_ok = (np.isfinite(y) & np.all(np.isfinite(P), axis=1)).astype(bool).reshape(-1)
+    if not np.any(row_ok):
+        raise ValueError("No finite rows for forward-mapping (check data cleaning).")
+    P = P[row_ok]; y = y[row_ok]
+
+    mu_f = {}
+    for s in range(int(state_count)):
+        w = P[:, s]
+        denom = float(w.sum()) + 1e-12
+        mu_f[s] = float(np.dot(w, y) / denom)
+
+    ranked = sorted(mu_f.items(), key=lambda kv: kv[1])  # low → high
+    if len(ranked) < 3:
+        raise ValueError(f"Need at least 3 states to map → Bear/Choppy/Bull, got {len(ranked)}")
+    s_bear, _ = ranked[0]
+    s_mid,  _ = ranked[len(ranked)//2]
+    s_bull, _ = ranked[-1]
+    mapping = {s_bear: "Bear", s_mid: "Choppy", s_bull: "Bull"}
+
+    print(f"State forward means (H={h}d):", {k: f"{v:+.6f}" for k, v in mu_f.items()})
+    print("Forward-mapping (highest→Bull, lowest→Bear):", mapping)
+    return lambda s: mapping[int(s)]
 
 def apply_hysteresis(bool_series, k_enter=CHOP_ENTER_K, k_exit=CHOP_EXIT_K):
     raw = bool_series.astype(bool).values
@@ -390,12 +392,11 @@ def apply_hysteresis(bool_series, k_enter=CHOP_ENTER_K, k_exit=CHOP_EXIT_K):
 
 # ---------- Adaptive guardrails ----------
 def trend_guardrail_adaptive(df):
-    # Vol-aware thresholds (per-bar)
     volp = df["VolPctl252"].clip(0,1).fillna(0.0)
-    adx_min_dyn  = GUARD_ADX_MIN_BASE + 10.0*volp         # 20→30 as vol rises
-    rsi_bull_dyn = RSI_BULL_BASE  + 5.0*volp              # 60→65
-    rsi_bear_dyn = RSI_BEAR_BASE  - 5.0*volp              # 45→40
-    drift_abs_dyn= DRIFT_OVR_ABS_BASE * (1.0 + 0.75*volp) # stricter in high vol
+    adx_min_dyn  = GUARD_ADX_MIN_BASE + 10.0*volp
+    rsi_bull_dyn = RSI_BULL_BASE  + 5.0*volp
+    rsi_bear_dyn = RSI_BEAR_BASE  - 5.0*volp
+    drift_abs_dyn= DRIFT_OVR_ABS_BASE * (1.0 + 0.75*volp)
 
     df = df.copy()
     df["ADXminDyn"]   = adx_min_dyn
@@ -453,8 +454,8 @@ def range_aware_choppy_strict(df):
     narrow   = (dwidth_pct <= RANGE_DWIDTH_PCTL).fillna(False)
     return (adx_low & drift_sm & narrow)
 
-# ---------- Build labels with debounce + weekly overlay + adaptive thresholds ----------
-def build_labels_rt(df, states, label_by_state, weekly_conf):
+# ---------- Build labels with debounce + **NO weekly overlay** ----------
+def build_labels_rt(df, states, label_by_state):
     base = np.array([label_by_state(s) for s in states], dtype=object)
 
     # Adaptive guardrails
@@ -501,55 +502,40 @@ def build_labels_rt(df, states, label_by_state, weekly_conf):
                     proposed.append("Bear"); reason.append("Choppy→Bear by drift (adaptive)"); continue
             proposed.append("Choppy"); reason.append("Range/Low-vol (strict)"); continue
 
-        # base mapping
         if   lab_g == "Bull": reason.append("HMM→Bull (train-frozen)")
         elif lab_g == "Bear": reason.append("HMM→Bear (train-frozen)")
         else:                  reason.append("HMM→Choppy (train-frozen)")
         proposed.append(lab_g)
 
-    # --- Weekly overlay confirmation (multi-resolution) + causal persistence ---
-    bullW = weekly_conf["BullConfirmW"].reindex(df.index).fillna(False)
-    bearW = weekly_conf["BearConfirmW"].reindex(df.index).fillna(False)
-
+    # --- Causal persistence ONLY (no weekly gate) ---
     out=[]; why=[]
     last_label=None
     pending=None; pend_count=0
 
     for i, (p, r) in enumerate(zip(proposed, reason)):
-        # If guardrail forced at this bar, commit immediately (already encoded in proposed via forced)
         forced_now = (p in ("Bull","Bear")) and ( (bull_force.iloc[i] and p=="Bull") or (bear_force.iloc[i] and p=="Bear") )
 
-        # Weekly must confirm directional flips
-        wk_conf_ok = True
-        if p=="Bull": wk_conf_ok = bool(bullW.iloc[i])
-        if p=="Bear": wk_conf_ok = bool(bearW.iloc[i])
-
-        # If no last label yet, set and continue
         if last_label is None:
-            out.append(p); why.append(r + (" | wkOK" if wk_conf_ok else " | wkNO"))
+            out.append(p); why.append(r)
             last_label=p; pending=None; pend_count=0
             continue
 
-        # If same as last, reset pending
         if p == last_label:
-            out.append(last_label); why.append("Stay " + last_label + " | " + r + " | wkOK" if wk_conf_ok else " | wkNO")
+            out.append(last_label); why.append("Stay " + last_label + " | " + r)
             pending=None; pend_count=0
             continue
 
-        # Different => start / continue pending
         if pending is None or pending != p:
             pending = p; pend_count = 1
         else:
             pend_count += 1
 
-        # Commit if: (a) forced_now, or (b) persistence AND weekly confirmation are satisfied
-        if forced_now or (pend_count >= MIN_PERSIST_DAYS and wk_conf_ok):
+        if forced_now or (pend_count >= MIN_PERSIST_DAYS):
             last_label = p
-            out.append(last_label); why.append(("FORCED " if forced_now else "Flip")+"→"+last_label+f" (persist {pend_count}d, wkConf={wk_conf_ok})")
+            out.append(last_label); why.append(("FORCED " if forced_now else "Flip")+"→"+last_label+f" (persist {pend_count}d)")
             pending=None; pend_count=0
         else:
-            # hold previous label
-            out.append(last_label); why.append(f"Hold {last_label} (pending {pending} {pend_count}/{MIN_PERSIST_DAYS}, wkConf={wk_conf_ok})")
+            out.append(last_label); why.append(f"Hold {last_label} (pending {pending} {pend_count}/{MIN_PERSIST_DAYS})")
 
     lbl = df[["close","LogReturn"]].copy()
     lbl["Label_rt"] = out
@@ -604,9 +590,6 @@ def main():
     full = fetch_btc_yf("2014-01-01", TEST_END or "2025-12-31")
     feats = build_features(full)
 
-    # Weekly overlay (multi-resolution)
-    wk_conf = weekly_overlay(full)
-
     # Train/Test split
     tr = feats.loc[(feats.index >= pd.Timestamp(TRAIN_START, tz="UTC")) &
                    (feats.index <= pd.Timestamp(TRAIN_END,   tz="UTC"))].copy()
@@ -624,20 +607,28 @@ def main():
     # 3) Fit HMM on TRAIN
     hmm = fit_hmm(X_tr, n_states=N_STATES, seed=SEED)
 
-    # 4) Freeze state→label mapping from TRAIN soft means of *returns*
+    # 4) Freeze state→label mapping from TRAIN
     post = hmm.predict_proba(X_tr)
-    mu_state = {s: float(np.sum(post[:,s]*tr["LogReturn"].values)/(post[:,s].sum()+1e-12)) for s in range(N_STATES)}
-    label_by_state = state_label_mapper_from_train(mu_state)
-    print("State means (TRAIN daily mu):", {k: f"{v:+.6f}" for k,v in mu_state.items()})
+    if MAP_USING_FORWARD:
+        label_by_state = state_label_mapper_from_train_forward(
+            posteriors=post,
+            close_series=tr["close"],
+            h=H_MAP,
+            state_count=N_STATES
+        )
+    else:
+        mu_state = {s: float(np.sum(post[:,s]*tr["LogReturn"].values)/(post[:,s].sum()+1e-12)) for s in range(N_STATES)}
+        print("State means (TRAIN daily mu):", {k: f"{v:+.6f}" for k,v in mu_state.items()})
+        label_by_state = state_label_mapper_from_train_same_day(mu_state)
 
     # 5) Decode TRAIN/TEST causally (no future info)
     ch_tr, td_tr = score_blocks(tr)
     ch_te, td_te = score_blocks(te)
-    st_tr = debounce_states_offline(hmm.predict(X_tr), min_run=DEBOUNCE_MIN_RUN)  # offline only
+    st_tr = debounce_states_offline(hmm.predict(X_tr), min_run=DEBOUNCE_MIN_RUN)  # offline prettifier
     st_te = decode_causal_dynamic(hmm, X_te, ch_te, td_te)
 
-    lbl_tr = build_labels_rt(tr, st_tr, label_by_state, wk_conf)
-    lbl_te = build_labels_rt(te, st_te, label_by_state, wk_conf)
+    lbl_tr = build_labels_rt(tr, st_tr, label_by_state)
+    lbl_te = build_labels_rt(te, st_te, label_by_state)
 
     # 6) Save CSV (TEST focus)
     out = lbl_te.copy()
@@ -670,7 +661,7 @@ def main():
     for a,b,lab in segs_from_labels(list(ts), list(labs)):
         ax.axvspan(a, b, color=colors.get(lab,"#ccc"), alpha=0.18, linewidth=0)
     ax.set_yscale("log"); ax.grid(True, alpha=0.25)
-    ax.set_title("BTC-USD — Regime Highlights (Train 2014-2018, Test 2019+; Debounce+Weekly+Adaptive)")
+    ax.set_title(f"BTC-USD — Regime Highlights (Train 2014-2018, Test 2019+; Forward-map H={H_MAP}d; No Weekly Gate)")
     ax.set_xlabel("Date"); ax.set_ylabel("Price (log scale)")
     ax.legend(handles=[Patch(facecolor=colors["Bull"], alpha=0.35, label="Bull"),
                        Patch(facecolor=colors["Bear"], alpha=0.35, label="Bear"),
