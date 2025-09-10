@@ -1,0 +1,11 @@
+(base) amiyasekhar@Amiyas-MBP-3 TradingStratFromScratch % python3 paxg_rotation_mc.py \
+  --regimes_csv btc_usd_regimes_2014train_2019plus_test.csv \
+  --start 2019-01-01 --end 2025-12-31 \
+  --dxy_hold_days 0 \
+  --bear_rel_mom --bear_mom_len 40 --bear_mom_thresh 0.0 \
+  --paxg_mom_len 40 --paxg_mom_thresh 0.01 \
+  --paxg_trailing_stop --paxg_trail_atr_len 14 --paxg_trail_k 2.5 --paxg_reenter_cooldown 7 \
+  --mc_sims 500 --mc_max_delay_days 3 \
+  --mc_slip_in_bps_mean 5 --mc_slip_out_bps_mean 5 \
+  --mc_ret_noise_sigma 0.001 \
+  --out_prefix rot_dual_mom_tighttrail_2019_2025
