@@ -4,12 +4,18 @@
 """
 Rotation strategy + Monte-Carlo on BTC/PAXG guided by your regime detector.
 
-Bear market behavior:
-- Enter PAXG only when BOTH BTC is weak (absolute or relative) AND PAXG is strong.
-- Optional PAXG trailing stop with cool-down; re-enter only after cool-down and PAXG regains strength.
-- Bull => long BTC (optional DXY-down gate)
-- Choppy => flat
-- On regime change, exit immediately; then wait for the new gate.
+Edits you asked for (focused on Bear/PAXG behavior):
+1) Trailing stop confirmation: require N consecutive closes below the trailing stop
+   before stopping out (flag: --stop_confirm_days, default 1).
+2) Fast re-entry after stop-out: optional "new-high" re-entry instead of fixed cooldown.
+   When enabled (--reenter_mode newhigh), re-enter once PAXG makes a new high vs the
+   last stop-out's anchor high, with a small buffer (--reenter_eps, default 0.003 = 0.3%).
+
+Other behavior (unchanged from your good run):
+- Bear: enter PAXG only when BOTH BTC is weak AND PAXG is strong.
+- Bull: long BTC (optional DXY gating via --dxy_hold_days > 0).
+- Choppy: flat.
+- On regime flip: immediate exit, then wait for the new regime’s gates.
 
 Outputs:
 - <out_prefix>_summary.csv
@@ -127,11 +133,17 @@ def build_positions(
     paxg_mom=None, paxg_mom_thresh=0.0,
     # PAXG trailing stop bits
     pax_close=None, pax_atr=None,
-    use_paxg_trail=False, trail_k=3.0, reenter_cooldown=5
+    use_paxg_trail=False, trail_k=3.0,
+    # NEW: stop confirmation + re-entry control
+    stop_confirm_days=1,                 # require N consecutive closes below trail to stop
+    reenter_mode="cooldown",             # "cooldown" or "newhigh"
+    reenter_cooldown=5,                  # used if reenter_mode="cooldown"
+    reenter_eps=0.003                    # used if reenter_mode="newhigh"
 ):
     """
     Enter PAXG in Bear only if BTC is weak AND PAXG is strong.
-    Optional PAXG trailing stop => exit to CASH; after cooldown, allow re-entry if gates satisfied again.
+    Trailing stop can be confirmed over multiple days.
+    After stop-out, either wait a fixed cooldown or re-enter on new-high vs the stop-out anchor.
     """
     regimes = regimes.reindex(dates).ffill()
     dxy_up   = dxy_up.reindex(dates).fillna(False)
@@ -147,29 +159,52 @@ def build_positions(
     if pax_atr is not None:
         pax_atr = _ensure_series_1d(pax_atr, index=dates).reindex(dates).ffill()
 
+    def btc_is_weak(dt):
+        return True if btc_mom is None else bool(btc_mom.loc[dt] <= bear_mom_thresh)
+
+    def paxg_is_strong(dt):
+        return True if paxg_mom is None else bool(paxg_mom.loc[dt] >= paxg_mom_thresh)
+
     pos = []
     last_regime = None
     last_pos = "CASH"
+
+    # --- trailing stop state ---
+    trail_high_close = None              # running high since entry
+    trail_breach_run = 0                 # consecutive closes below trail
+    # re-entry state
     cooldown_left = 0
-    high_close = None
+    stopout_anchor_high = None           # last trail high at stop-out (for "newhigh" re-entry)
 
     for dt, reg in zip(dates, regimes.values):
         if reg not in ("Bull","Bear","Choppy"):
             reg = "Choppy"
 
-        # regime flip => exit, reset
+        # regime flip => hard reset of position; keep cooldown ticking
         if (last_regime is None) or (reg != last_regime):
             last_pos = "CASH"
-            high_close = None
+            trail_high_close = None
+            trail_breach_run = 0
+            stopout_anchor_high = None
+            if cooldown_left > 0:
+                cooldown_left -= 1
+
             if reg == "Bear":
-                if (btc_mom is None or btc_mom.loc[dt] <= bear_mom_thresh) and \
-                   (paxg_mom is None or paxg_mom.loc[dt] >= paxg_mom_thresh) and \
-                   (cooldown_left == 0):
-                    last_pos = "PAXG"
-                    high_close = float(pax_close.loc[dt]) if pax_close is not None else None
+                enter_ready = btc_is_weak(dt) and paxg_is_strong(dt)
+                if enter_ready and ( (not use_dxy) or dxy_up.loc[dt] ):
+                    if reenter_mode == "cooldown" and cooldown_left > 0:
+                        pass
+                    else:
+                        last_pos = "PAXG"
+                        if pax_close is not None:
+                            trail_high_close = float(pax_close.loc[dt])
+                        trail_breach_run = 0
+                        stopout_anchor_high = None
+
             elif reg == "Bull":
-                if not use_dxy or dxy_down.loc[dt]:
+                if (not use_dxy) or dxy_down.loc[dt]:
                     last_pos = "BTC"
+
             else:  # Choppy
                 last_pos = "CASH"
 
@@ -177,45 +212,63 @@ def build_positions(
             pos.append(last_pos)
             continue
 
-        # same-regime day
+        # same-regime logic
         if reg == "Choppy":
             last_pos = "CASH"
-            high_close = None
+            trail_high_close = None
+            trail_breach_run = 0
+            stopout_anchor_high = None
 
         elif reg == "Bear":
             # tick cooldown
             if cooldown_left > 0:
                 cooldown_left -= 1
 
-            # trailing stop (only when long PAXG)
+            # manage trailing stop if holding PAXG
             if use_paxg_trail and last_pos == "PAXG" and pax_close is not None and pax_atr is not None:
-                px = float(pax_close.loc[dt]); atr = float(pax_atr.loc[dt]) if np.isfinite(pax_atr.loc[dt]) else 0.0
-                if high_close is None:
-                    high_close = px
+                px  = float(pax_close.loc[dt])
+                atr = float(pax_atr.loc[dt]) if np.isfinite(pax_atr.loc[dt]) else 0.0
+                trail_high_close = max(trail_high_close or px, px)
+                stop_lvl = trail_high_close - trail_k * atr if np.isfinite(atr) else -np.inf
+
+                if px < stop_lvl:
+                    trail_breach_run += 1
                 else:
-                    high_close = max(high_close, px)
-                stop = high_close - trail_k * atr if np.isfinite(atr) else -np.inf
-                if px < stop:
+                    trail_breach_run = 0
+
+                if trail_breach_run >= max(1, int(stop_confirm_days)):
+                    # confirmed stop-out
                     last_pos = "CASH"
-                    high_close = None
-                    cooldown_left = reenter_cooldown
+                    cooldown_left = (reenter_cooldown if reenter_mode == "cooldown" else 0)
+                    stopout_anchor_high = trail_high_close
+                    trail_high_close = None
+                    trail_breach_run = 0
 
-            # consider entries (or re-entries) only if not currently in PAXG
+            # entries / re-entries when NOT in PAXG
             if last_pos != "PAXG":
-                enter_ready = (
-                    (btc_mom is None or btc_mom.loc[dt] <= bear_mom_thresh) and
-                    (paxg_mom is None or paxg_mom.loc[dt] >= paxg_mom_thresh) and
-                    (cooldown_left == 0)
-                )
-                if enter_ready:
-                    if not use_dxy or dxy_up.loc[dt]:
-                        last_pos = "PAXG"
-                        high_close = float(pax_close.loc[dt]) if pax_close is not None else None
+                need_btc_weak = btc_is_weak(dt)
+                need_paxg_str = paxg_is_strong(dt)
+                allow_entry = need_btc_weak and need_paxg_str
 
-        elif reg == "Bull":
-            if last_pos != "BTC":
-                if not use_dxy or dxy_down.loc[dt]:
-                    last_pos = "BTC"
+                if reenter_mode == "cooldown":
+                    allow_entry = allow_entry and (cooldown_left == 0)
+                elif reenter_mode == "newhigh":
+                    if stopout_anchor_high is not None and pax_close is not None:
+                        px_now = float(pax_close.loc[dt])
+                        allow_entry = allow_entry and (px_now >= (1.0 + float(reenter_eps)) * float(stopout_anchor_high))
+
+                if allow_entry and ( (not use_dxy) or dxy_up.loc[dt] ):
+                    last_pos = "PAXG"
+                    if pax_close is not None:
+                        trail_high_close = float(pax_close.loc[dt])
+                    trail_breach_run = 0
+                    stopout_anchor_high = None
+
+        else:  # Bull
+            last_pos = "BTC"
+            trail_high_close = None
+            trail_breach_run = 0
+            stopout_anchor_high = None
 
         pos.append(last_pos)
 
@@ -288,7 +341,7 @@ def simulate_mc(dates, pos_target, ret_btc, ret_paxg,
                 eq *= math.exp(Rb[s, t])
             elif pos == "PAXG":
                 eq *= math.exp(Rp[s, t])
-            # CASH → no change
+            # CASH: no change
 
             path[t] = eq
             cur_pos = pos
@@ -422,7 +475,7 @@ def main():
     ap.add_argument("--dxy_ticker", default="DX=F")
     ap.add_argument("--dxy_ema_fast", type=int, default=10)
     ap.add_argument("--dxy_ema_slow", type=int, default=30)
-    ap.add_argument("--dxy_hold_days", type=int, default=3)  # 0 => ignore DXY
+    ap.add_argument("--dxy_hold_days", type=int, default=0)  # 0 => ignore DXY (matches your good run)
 
     # Bear gating: BTC weakness (absolute or relative if --bear_rel_mom)
     ap.add_argument("--bear_mom_len", type=int, default=0, help="0=off; lookback L for BTC momentum or (BTC-PAXG) if --bear_rel_mom")
@@ -433,11 +486,17 @@ def main():
     ap.add_argument("--paxg_mom_len", type=int, default=0, help="0=off; lookback L for PAXG momentum (>= means strong).")
     ap.add_argument("--paxg_mom_thresh", type=float, default=0.0, help="PAXG strength threshold (>= means strong).")
 
-    # PAXG trailing stop
+    # Trailing stop controls
     ap.add_argument("--paxg_trailing_stop", action="store_true", help="Enable PAXG trailing stop during Bear.")
     ap.add_argument("--paxg_trail_atr_len", type=int, default=14, help="ATR length for trailing stop.")
-    ap.add_argument("--paxg_trail_k", type=float, default=2.5, help="Stop = highest close since entry minus k*ATR.")
-    ap.add_argument("--paxg_reenter_cooldown", type=int, default=7, help="Days to wait after a stop-out before re-considering PAXG.")
+    ap.add_argument("--paxg_trail_k", type=float, default=2.5, help="Stop = highest close since entry minus k*ATR (your tighttrail default).")
+
+    # NEW: stop confirmation + re-entry policy
+    ap.add_argument("--stop_confirm_days", type=int, default=1, help="Require N consecutive closes below trail to stop (1 = same-day).")
+    ap.add_argument("--reenter_mode", choices=["cooldown","newhigh"], default="cooldown",
+                    help="Re-entry policy after stop-out: 'cooldown' (fixed wait) or 'newhigh' (break prior anchor high).")
+    ap.add_argument("--paxg_reenter_cooldown", type=int, default=7, help="Days to wait after stop-out if reenter_mode=cooldown.")
+    ap.add_argument("--reenter_eps", type=float, default=0.003, help="New-high buffer for reenter_mode=newhigh (e.g., 0.003 = +0.3%).")
 
     # Monte-Carlo
     ap.add_argument("--mc_sims", type=int, default=500)
@@ -517,7 +576,10 @@ def main():
         pax_close=pax_close, pax_atr=pax_atr,
         use_paxg_trail=bool(args.paxg_trailing_stop),
         trail_k=float(args.paxg_trail_k),
-        reenter_cooldown=int(args.paxg_reenter_cooldown)
+        stop_confirm_days=int(args.stop_confirm_days),
+        reenter_mode=str(args.reenter_mode),
+        reenter_cooldown=int(args.paxg_reenter_cooldown),
+        reenter_eps=float(args.reenter_eps)
     )
 
     # Monte-Carlo
