@@ -6,7 +6,7 @@ Rotation strategy + Monte-Carlo on BTC/PAXG guided by your regime detector.
 
 Rules:
 - If regime == Bull: long BTC (AFTER DXY-DOWN confirm at transition into Bull)
-- If regime == Bear: long PAXG (AFTER DXY-UP confirm at transition into Bear)
+- If regime == Bear: long PAXG (AFTER DXY-UP confirm at transition into Bear, and optional momentum gate)
 - If regime == Choppy: flat (no position)
 - Stay in the asset while regime persists (no repeated DXY gates).
 - On any regime change, exit current asset immediately, then wait for the new gate.
@@ -24,7 +24,7 @@ Outputs:
 - <out_prefix>_cagr_hist.png
 - <out_prefix>_positions.png
 - <out_prefix>_btc_hodl_summary.csv
-- <out_prefix>_bear_windows_summary.csv   <<< NEW
+- <out_prefix>_bear_windows_summary.csv
 """
 
 import argparse, math, warnings
@@ -39,12 +39,10 @@ def _to_utc_index(idx):
     return pd.to_datetime(idx, utc=True)
 
 def _ensure_series_1d(x, index=None):
-    # Always return a 1-D pandas Series with the given (or inferred) index
     if isinstance(x, pd.DataFrame):
         x = x.squeeze()
     if isinstance(x, pd.Series):
         return pd.Series(np.asarray(x.values).reshape(-1), index=_to_utc_index(x.index))
-    # numpy or list
     arr = np.asarray(x).reshape(-1)
     if index is None:
         raise ValueError("Index required when coercing raw array to Series.")
@@ -90,11 +88,20 @@ def load_regimes_csv(path):
 
 # -------------- DXY confirmation --------------
 def dxy_confirm(dxy_close, ema_fast=10, ema_slow=30, hold_days=3):
+    """
+    Returns:
+      up_flag   : True after 'hold_days' consecutive ef>es (DXY uptrend)
+      down_flag : True after 'hold_days' consecutive ef<es (DXY downtrend)
+    If hold_days <= 0, returns immediate raw ef>es and ef<es (no gating).
+    """
     close = _ensure_series_1d(dxy_close)
     ef = close.ewm(span=ema_fast, adjust=False).mean()
     es = close.ewm(span=ema_slow, adjust=False).mean()
-    up_raw   = ef > es
-    down_raw = ef < es
+    up_raw   = (ef > es)
+    down_raw = (ef < es)
+
+    if hold_days <= 0:
+        return up_raw.astype(bool), down_raw.astype(bool)
 
     def hold_flag(raw_bool):
         raw = np.asarray(raw_bool, dtype=bool).reshape(-1)
@@ -108,10 +115,16 @@ def dxy_confirm(dxy_close, ema_fast=10, ema_slow=30, hold_days=3):
     return hold_flag(up_raw), hold_flag(down_raw)
 
 # -------------- position builder --------------
-def build_positions(dates, regimes, dxy_up, dxy_down):
+def build_positions(dates, regimes, dxy_up, dxy_down, mom_series=None, mom_thresh=0.0):
+    """
+    mom_series: Series used as a Bear entry filter (absolute or relative momentum).
+                Enter PAXG in Bear only when mom_series >= mom_thresh.
+    """
     regimes = regimes.reindex(dates).ffill()
     dxy_up   = dxy_up.reindex(dates).fillna(False)
     dxy_down = dxy_down.reindex(dates).fillna(False)
+    if mom_series is not None:
+        mom_series = _ensure_series_1d(mom_series, index=dates).reindex(dates).fillna(0.0)
 
     pos = []
     last_pos = "CASH"
@@ -130,17 +143,23 @@ def build_positions(dates, regimes, dxy_up, dxy_down):
             wait_target = None
 
             if reg == "Bear":
-                if dxy_up.loc[dt]:
-                    last_pos = "PAXG"
+                mom_ok = True
+                if mom_series is not None:
+                    mom_ok = bool(mom_series.loc[dt] >= mom_thresh)
+                if mom_ok:
+                    if dxy_up.loc[dt]:
+                        last_pos = "PAXG"
+                    else:
+                        waiting_gate = True; wait_target = "PAXG"
                 else:
-                    waiting_gate = True
-                    wait_target = "PAXG"
+                    last_pos = "CASH"
+
             elif reg == "Bull":
                 if dxy_down.loc[dt]:
                     last_pos = "BTC"
                 else:
-                    waiting_gate = True
-                    wait_target = "BTC"
+                    waiting_gate = True; wait_target = "BTC"
+
             else:
                 last_pos = "CASH"
 
@@ -150,13 +169,19 @@ def build_positions(dates, regimes, dxy_up, dxy_down):
 
         # same regime
         if reg == "Choppy":
-            last_pos = "CASH"
-            waiting_gate = False
-            wait_target = None
+            last_pos = "CASH"; waiting_gate = False; wait_target = None
+
         elif reg == "Bear":
-            if last_pos != "PAXG":
-                if waiting_gate and wait_target == "PAXG" and dxy_up.loc[dt]:
-                    last_pos = "PAXG"; waiting_gate=False; wait_target=None
+            mom_ok = True
+            if mom_series is not None:
+                mom_ok = bool(mom_series.loc[dt] >= mom_thresh)
+            if not mom_ok:
+                last_pos = "CASH"; waiting_gate = False; wait_target = None
+            else:
+                if last_pos != "PAXG":
+                    if waiting_gate and wait_target == "PAXG" and dxy_up.loc[dt]:
+                        last_pos = "PAXG"; waiting_gate=False; wait_target=None
+
         elif reg == "Bull":
             if last_pos != "BTC":
                 if waiting_gate and wait_target == "BTC" and dxy_down.loc[dt]:
@@ -173,23 +198,18 @@ def simulate_mc(dates, pos_target, ret_btc, ret_paxg,
                 slip_bps_std_frac=0.5,
                 ret_noise_sigma=0.001,
                 seed=42):
-    rng = np.random.default_rng(seed)
+    """
+    Deterministic per-simulation RNG controls delays, slippage, and noise.
+    Exit is applied before entry on switch bars.
+    """
     dates = pd.DatetimeIndex(dates)
     N = len(dates)
 
-    # --- coerce returns to 1-D numpy
     rb = np.asarray(_ensure_series_1d(ret_btc, index=dates).reindex(dates).fillna(0.0).values).reshape(-1)
     rp = np.asarray(_ensure_series_1d(ret_paxg, index=dates).reindex(dates).fillna(0.0).values).reshape(-1)
 
-    # Precompute noise and tile
-    noise_btc  = rng.normal(0.0, ret_noise_sigma, size=(sims, N))
-    noise_paxg = rng.normal(0.0, ret_noise_sigma, size=(sims, N))
-
-    Rb = np.tile(rb[None, :], (sims, 1)) + noise_btc   # (sims, N)
-    Rp = np.tile(rp[None, :], (sims, 1)) + noise_paxg  # (sims, N)
-
     tgt = pos_target.reindex(dates).fillna("CASH").astype(str).values
-    # find switch indices on target positions
+
     switch_idx = []
     prev = tgt[0]
     for i in range(1, N):
@@ -201,43 +221,46 @@ def simulate_mc(dates, pos_target, ret_btc, ret_paxg,
     trade_rows = []
 
     for s in range(sims):
-        # build effective positions with random delays on switches
+        rng = np.random.default_rng(seed + 1000 + s)
+
+        Rb = rb + rng.normal(0.0, ret_noise_sigma, size=N)
+        Rp = rp + rng.normal(0.0, ret_noise_sigma, size=N)
+
         eff = tgt.copy()
         if max_delay_days > 0 and len(switch_idx) > 0:
-            rng_delays = np.random.default_rng(seed + 13*s)  # path-specific seed for reproducibility
-            delays = rng_delays.integers(0, max_delay_days+1, size=len(switch_idx))
+            delays = rng.integers(0, max_delay_days + 1, size=len(switch_idx))
             for j, i_sw in enumerate(switch_idx):
                 d = int(delays[j])
                 if d > 0:
-                    new_state = eff[i_sw]
-                    old_state = eff[i_sw-1]
+                    old_state = eff[i_sw - 1]
                     i_end = min(N, i_sw + d)
-                    eff[i_sw:i_end] = old_state
+                    eff[i_sw:i_end] = old_state  # extend old state during delay
 
         eq = 1.0
         path = np.zeros(N, dtype=float)
         cur_pos = "CASH"
+
         for t in range(N):
             pos = eff[t]
             entry = (cur_pos != pos) and (pos in ("BTC","PAXG"))
             exit_ = (cur_pos in ("BTC","PAXG")) and (pos != cur_pos)
 
-            # slippage draws (gaussian >= 0)
-            if entry:
-                slip_in = max(0.0, np.random.normal(slip_in_bps_mean, slip_in_bps_mean*slip_bps_std_frac)) / 10000.0
-                eq *= (1.0 - slip_in)
-                trade_rows.append({"sim": s, "date": dates[t], "action": f"BUY_{pos}", "equity": eq})
+            # EXIT first, then ENTRY
             if exit_:
-                slip_out = max(0.0, np.random.normal(slip_out_bps_mean, slip_out_bps_mean*slip_bps_std_frac)) / 10000.0
+                slip_out = max(0.0, rng.normal(slip_out_bps_mean, slip_out_bps_mean * slip_bps_std_frac)) / 10000.0
                 eq *= (1.0 - slip_out)
                 trade_rows.append({"sim": s, "date": dates[t], "action": f"EXIT_{cur_pos}", "equity": eq})
 
-            # apply noisy return
+            if entry:
+                slip_in = max(0.0, rng.normal(slip_in_bps_mean, slip_in_bps_mean * slip_bps_std_frac)) / 10000.0
+                eq *= (1.0 - slip_in)
+                trade_rows.append({"sim": s, "date": dates[t], "action": f"BUY_{pos}", "equity": eq})
+
             if pos == "BTC":
-                eq *= math.exp(Rb[s, t])
+                eq *= math.exp(Rb[t])
             elif pos == "PAXG":
-                eq *= math.exp(Rp[s, t])
-            # CASH => no change
+                eq *= math.exp(Rp[t])
+            # CASH → no change
 
             path[t] = eq
             cur_pos = pos
@@ -261,7 +284,7 @@ def simulate_mc(dates, pos_target, ret_btc, ret_paxg,
 
     return summary_df, equity_wide, trade_log
 
-# ---------------- Bear-window evaluation (NEW) ----------------
+# ---------------- Bear-window evaluation ----------------
 def find_bear_windows(regimes_series):
     reg = regimes_series.astype(str)
     idx = reg.index
@@ -280,15 +303,9 @@ def find_bear_windows(regimes_series):
     return windows
 
 def summarize_bears(pref, dates, regimes_series, equity_wide, r_btc, r_pax):
-    """
-    Build a CSV reporting returns inside each Bear window:
-      start, end, days, BTC_ret, PAXG_ret, Strat_p10, Strat_p50, Strat_p90
-    Also an 'ALL_BEARS' row using the concatenated mask.
-    """
     reg = regimes_series.reindex(dates).ffill()
     windows = find_bear_windows(reg)
 
-    # Strategy log-returns per sim for flexible slicing
     logret_wide = equity_wide.apply(lambda col: np.log(col/col.shift(1))).fillna(0.0)
 
     rows = []
@@ -298,11 +315,9 @@ def summarize_bears(pref, dates, regimes_series, equity_wide, r_btc, r_pax):
         all_mask |= mask
         n = int(mask.sum())
 
-        # BTC/PAXG HODL returns in the window
         btc_ret = float(np.exp(r_btc.reindex(dates)[mask].sum()) - 1.0)
         pax_ret = float(np.exp(r_pax.reindex(dates)[mask].sum()) - 1.0)
 
-        # Strategy distribution across simulations
         sim_rets = np.exp(logret_wide[mask].sum(axis=0).values) - 1.0
         p10 = float(np.percentile(sim_rets, 10))
         p50 = float(np.percentile(sim_rets, 50))
@@ -315,7 +330,6 @@ def summarize_bears(pref, dates, regimes_series, equity_wide, r_btc, r_pax):
                          btc_ret=btc_ret, paxg_ret=pax_ret,
                          strat_p10=p10, strat_p50=p50, strat_p90=p90))
 
-    # Combined Bears
     if all_mask.any():
         btc_ret_all = float(np.exp(r_btc.reindex(dates)[all_mask].sum()) - 1.0)
         pax_ret_all = float(np.exp(r_pax.reindex(dates)[all_mask].sum()) - 1.0)
@@ -332,11 +346,10 @@ def summarize_bears(pref, dates, regimes_series, equity_wide, r_btc, r_pax):
     out = pd.DataFrame(rows, columns=["window","start","end","days","btc_ret","paxg_ret","strat_p10","strat_p50","strat_p90"])
     out.to_csv(f"{pref}_bear_windows_summary.csv", index=False)
 
-    # Console summary
     if not out.empty:
         print("\n=== Bear regime performance ===")
         last = out.iloc[-1] if out.iloc[-1]["window"] == "ALL_BEARS" else None
-        for k, row in out.iterrows():
+        for _, row in out.iterrows():
             tag = row["window"]
             print(f"{tag:>10}  {row['start']} → {row['end']}  ({int(row['days'])}d)  "
                   f"BTC {row['btc_ret']:+.1%} | PAXG {row['paxg_ret']:+.1%} | "
@@ -347,12 +360,9 @@ def summarize_bears(pref, dates, regimes_series, equity_wide, r_btc, r_pax):
 
 # ---------------- plotting helpers ----------------
 def plot_equity_band_vs_btc(pref, dates, equity_wide, r_btc):
-    # Strategy band
     eq_med = equity_wide.median(axis=1)
     eq_p10 = equity_wide.quantile(0.10, axis=1)
     eq_p90 = equity_wide.quantile(0.90, axis=1)
-
-    # BTC HODL equity
     eq_btc = np.exp(_ensure_series_1d(r_btc, index=dates).reindex(dates).fillna(0.0).cumsum())
 
     fig, ax = plt.subplots(figsize=(12,6))
@@ -362,11 +372,8 @@ def plot_equity_band_vs_btc(pref, dates, equity_wide, r_btc):
     ax.set_yscale("log")
     ax.set_title("Equity (log) — Strategy band vs BTC HODL")
     ax.set_xlabel("Date"); ax.set_ylabel("Equity (start=1.0)")
-    ax.grid(alpha=0.25)
-    ax.legend()
-    plt.tight_layout()
-    fig.savefig(f"{pref}_equity_band.png", dpi=140)
-    plt.close(fig)
+    ax.grid(alpha=0.25); ax.legend()
+    plt.tight_layout(); plt.savefig(f"{pref}_equity_band.png", dpi=140); plt.close()
 
 def plot_cagr_hist(pref, summary_df):
     fig, ax = plt.subplots(figsize=(10,5.5))
@@ -374,12 +381,9 @@ def plot_cagr_hist(pref, summary_df):
     ax.set_title("Distribution of CAGR across simulations")
     ax.set_xlabel("CAGR"); ax.set_ylabel("Frequency")
     ax.grid(alpha=0.25)
-    plt.tight_layout()
-    fig.savefig(f"{pref}_cagr_hist.png", dpi=140)
-    plt.close(fig)
+    plt.tight_layout(); plt.savefig(f"{pref}_cagr_hist.png", dpi=140); plt.close()
 
 def plot_positions(pref, dates, pos_series):
-    # Make one-hot for stacked area: BTC=1, PAXG=1, CASH=1 (mutually exclusive)
     vals = pos_series.reindex(dates).fillna("CASH").astype(str)
     btc = (vals == "BTC").astype(int)
     pax = (vals == "PAXG").astype(int)
@@ -388,12 +392,9 @@ def plot_positions(pref, dates, pos_series):
     fig, ax = plt.subplots(figsize=(12,3.8))
     ax.stackplot(dates, cas, pax, btc, labels=["CASH","PAXG","BTC"])
     ax.set_title("Target position over time")
-    ax.set_xlabel("Date"); ax.set_yticks([0,1]); ax.set_yticklabels([" ", " "])
-    ax.grid(alpha=0.2, axis="x")
-    ax.legend(loc="upper left", ncol=3)
-    plt.tight_layout()
-    fig.savefig(f"{pref}_positions.png", dpi=140)
-    plt.close(fig)
+    ax.set_xlabel("Date"); ax.set_yticks([0,1]); ax.set_yticklabels([" "," "])
+    ax.grid(alpha=0.2, axis="x"); ax.legend(loc="upper left", ncol=3)
+    plt.tight_layout(); plt.savefig(f"{pref}_positions.png", dpi=140); plt.close()
 
 # ---------------- main ----------------
 def main():
@@ -406,7 +407,13 @@ def main():
     ap.add_argument("--dxy_ticker", default="DX=F")
     ap.add_argument("--dxy_ema_fast", type=int, default=10)
     ap.add_argument("--dxy_ema_slow", type=int, default=30)
-    ap.add_argument("--dxy_hold_days", type=int, default=3)
+    ap.add_argument("--dxy_hold_days", type=int, default=3, help="0 => disable DXY gates (immediate entries)")
+    # --- Bear momentum gate (NEW) ---
+    ap.add_argument("--bear_mom_len", type=int, default=0, help="0=off; else lookback L for momentum")
+    ap.add_argument("--bear_mom_thresh", type=float, default=0.0, help="threshold in log terms")
+    ap.add_argument("--bear_rel_mom", action="store_true",
+                    help="Use RELATIVE momentum (PAXG vs BTC) in Bear instead of absolute PAXG momentum")
+    # MC
     ap.add_argument("--mc_sims", type=int, default=500)
     ap.add_argument("--mc_max_delay_days", type=int, default=3)
     ap.add_argument("--mc_slip_in_bps_mean", type=float, default=5.0)
@@ -418,13 +425,11 @@ def main():
     start = pd.Timestamp(args.start, tz="UTC")
     end   = pd.Timestamp(args.end, tz="UTC")
 
-    # regimes
     reg = load_regimes_csv(args.regimes_csv)
     reg = reg.loc[(reg.index >= start) & (reg.index <= end)].copy()
     if reg.empty:
         raise RuntimeError("No regime rows in requested window.")
 
-    # prices
     btc = fetch_yf(args.btc, args.start, args.end)
     pax = fetch_yf(args.paxg, args.start, args.end)
     try:
@@ -432,11 +437,9 @@ def main():
     except Exception:
         dxy = fetch_yf("^DXY", args.start, args.end)
 
-    # master date index
     dates = reg.index.union(btc.index).union(pax.index).union(dxy.index)
     dates = dates.sort_values()
 
-    # returns
     def logrets_from_close(df):
         cs = df["close"].reindex(dates).ffill()
         lr = np.log(cs/cs.shift(1)).fillna(0.0)
@@ -446,17 +449,26 @@ def main():
     r_pax = logrets_from_close(pax)
     dxy_close = _ensure_series_1d(dxy["close"].reindex(dates).ffill(), index=dates)
 
-    # DXY gates
     up_flag, down_flag = dxy_confirm(dxy_close,
                                      ema_fast=args.dxy_ema_fast,
                                      ema_slow=args.dxy_ema_slow,
                                      hold_days=args.dxy_hold_days)
 
-    # target positions
-    regimes_series = reg["Label_rt"].reindex(dates).ffill()
-    pos_target = build_positions(dates, regimes_series, up_flag, down_flag)
+    # --- momentum series (absolute or relative) for Bear gate ---
+    mom_series = None
+    if args.bear_mom_len and args.bear_mom_len > 0:
+        L = int(args.bear_mom_len)
+        pax_close = _ensure_series_1d(pax["close"], index=pax.index).reindex(dates).ffill()
+        if args.bear_rel_mom:
+            btc_close = _ensure_series_1d(btc["close"], index=btc.index).reindex(dates).ffill()
+            mom_series = np.log(pax_close / btc_close) - np.log(pax_close.shift(L) / btc_close.shift(L))
+        else:
+            mom_series = np.log(pax_close / pax_close.shift(L))
 
-    # Monte-Carlo
+    regimes_series = reg["Label_rt"].reindex(dates).ffill()
+    pos_target = build_positions(dates, regimes_series, up_flag, down_flag,
+                                 mom_series=mom_series, mom_thresh=float(args.bear_mom_thresh))
+
     summary_df, equity_wide, trade_log = simulate_mc(
         dates, pos_target, r_btc, r_pax,
         sims=args.mc_sims,
@@ -472,20 +484,17 @@ def main():
     equity_wide.to_csv(f"{pref}_equity_paths.csv", index=True)
     trade_log.to_csv(f"{pref}_trade_log.csv", index=False)
 
-    # -------- BTC HODL benchmark (same dates) --------
     hodl_stats = perf_stats_from_logrets(r_btc)
     pd.DataFrame([hodl_stats]).to_csv(f"{pref}_btc_hodl_summary.csv", index=False)
 
-    # -------- Print text summary --------
-    med = summary_df.median()
-    p10 = summary_df.quantile(0.10)
-    p90 = summary_df.quantile(0.90)
+    med = summary_df.median(); p10 = summary_df.quantile(0.10); p90 = summary_df.quantile(0.90)
     print("\n=== Monte-Carlo summary (median [p10..p90]) ===")
     print(f"CAGR    : {med['cagr']:+.2%}  [{p10['cagr']:+.2%} .. {p90['cagr']:+.2%}]")
     print(f"Vol     : {med['vol']:.2%}   [{p10['vol']:.2%} .. {p90['vol']:.2%}]")
     print(f"Sharpe  : {med['sharpe']:.2f}   [{p10['sharpe']:.2f} .. {p90['sharpe']:.2f}]")
     print(f"MaxDD   : {med['max_dd']:.2%}   [{p10['max_dd']:.2%} .. {p90['max_dd']:.2%}]")
     print(f"TotRet  : {med['tot_ret']:+.2%}  [{p10['tot_ret']:+.2%} .. {p90['tot_ret']:+.2%}]")
+
     print("\n=== BTC HODL benchmark (same window) ===")
     print(f"CAGR    : {hodl_stats['cagr']:+.2%}")
     print(f"Vol     : {hodl_stats['vol']:.2%}")
@@ -493,12 +502,10 @@ def main():
     print(f"MaxDD   : {hodl_stats['max_dd']:.2%}")
     print(f"TotRet  : {hodl_stats['tot_ret']:+.2%}")
 
-    # -------- Plots --------
     plot_equity_band_vs_btc(pref, dates, equity_wide, r_btc)
     plot_cagr_hist(pref, summary_df)
     plot_positions(pref, dates, pos_target)
 
-    # -------- Bear regime performance (NEW) --------
     summarize_bears(pref, dates, regimes_series, equity_wide, r_btc, r_pax)
 
     print(f"[OK] Wrote:")
