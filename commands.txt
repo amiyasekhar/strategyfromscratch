@@ -1,11 +1,21 @@
-(base) amiyasekhar@Amiyas-MBP-3 TradingStratFromScratch % python3 paxg_rotation_mc.py \
+python3 test.py \
   --regimes_csv btc_usd_regimes_2014train_2019plus_test.csv \
   --start 2019-01-01 --end 2025-12-31 \
   --dxy_hold_days 0 \
   --bear_rel_mom --bear_mom_len 40 --bear_mom_thresh 0.0 \
   --paxg_mom_len 40 --paxg_mom_thresh 0.01 \
-  --paxg_trailing_stop --paxg_trail_atr_len 14 --paxg_trail_k 2.5 --paxg_reenter_cooldown 7 \
-  --mc_sims 500 --mc_max_delay_days 3 \
+  --paxg_trailing_stop --paxg_trail_atr_len 14 --paxg_trail_k 2.5 \
+  --stop_confirm_days 2 --reenter_mode newhigh --reenter_eps 0.003 \
+  --mc_sims 1000 \
+  --mc_max_delay_days 3 --mc_delay_geom_p 0.5 \
+  --mc_partial_fill_max_days 2 \
+  --mc_miss_prob 0.01 \
+  --mc_drought_prob 0.005 --mc_drought_mean_days 3 \
+  --mc_fee_bps_in 4 --mc_fee_bps_out 4 --mc_spread_bps 2 \
   --mc_slip_in_bps_mean 5 --mc_slip_out_bps_mean 5 \
+  --mc_slip_mult_bull 1.0 --mc_slip_mult_bear 1.3 --mc_slip_mult_choppy 1.15 \
+  --mc_vol_slip_k 50 \
   --mc_ret_noise_sigma 0.001 \
-  --out_prefix rot_dual_mom_tighttrail_2019_2025
+  --mc_shock_prob 0.01 --mc_shock_sigma 0.02 --mc_shock_mean_days 1 \
+  --mc_gap_weekend --mc_gap_sigma 0.01 \
+  --out_prefix rot_dual_mom_realisticMC_2019_2025

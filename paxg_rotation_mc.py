@@ -2,33 +2,45 @@
 # -*- coding: utf-8 -*-
 
 """
-Rotation strategy + Monte-Carlo on BTC/PAXG guided by your regime detector.
+test.py — Rotation strategy + Robust Monte-Carlo on BTC/PAXG guided by your regime detector.
 
-Edits you asked for (focused on Bear/PAXG behavior):
-1) Trailing stop confirmation: require N consecutive closes below the trailing stop
-   before stopping out (flag: --stop_confirm_days, default 1).
-2) Fast re-entry after stop-out: optional "new-high" re-entry instead of fixed cooldown.
-   When enabled (--reenter_mode newhigh), re-enter once PAXG makes a new high vs the
-   last stop-out's anchor high, with a small buffer (--reenter_eps, default 0.003 = 0.3%).
-
-Other behavior (unchanged from your good run):
-- Bear: enter PAXG only when BOTH BTC is weak AND PAXG is strong.
+What’s inside (key features):
+- Bear: long PAXG only when BTC is weak AND PAXG is strong (your gates).
 - Bull: long BTC (optional DXY gating via --dxy_hold_days > 0).
 - Choppy: flat.
-- On regime flip: immediate exit, then wait for the new regime’s gates.
+- Trailing stop on PAXG (ATR*k) with N-day confirmation and fast re-entry on new-high.
+- Robust Monte-Carlo with:
+  * Entry/exit delays (geometric), partial fills, missed trades
+  * Random “drought” (temporarily disable new entries)
+  * Fees + spread + slippage with regime multipliers and ATR%-linked bump
+  * Return noise, clustered “shock” days, optional weekend gaps
+- Output: summary CSVs, equity paths, trade log, plots, and bear windows performance table.
 
-Outputs:
-- <out_prefix>_summary.csv
-- <out_prefix>_equity_paths.csv
-- <out_prefix>_trade_log.csv
-- <out_prefix>_equity_band.png
-- <out_prefix>_cagr_hist.png
-- <out_prefix>_positions.png
-- <out_prefix>_btc_hodl_summary.csv
-- <out_prefix>_bear_windows_summary.csv
+Usage example (matches your last run shape):
+python3 test.py \
+  --regimes_csv btc_usd_regimes_2014train_2019plus_test.csv \
+  --start 2019-01-01 --end 2025-12-31 \
+  --dxy_hold_days 0 \
+  --bear_rel_mom --bear_mom_len 40 --bear_mom_thresh 0.0 \
+  --paxg_mom_len 40 --paxg_mom_thresh 0.01 \
+  --paxg_trailing_stop --paxg_trail_atr_len 14 --paxg_trail_k 2.5 \
+  --stop_confirm_days 2 --reenter_mode newhigh --reenter_eps 0.003 \
+  --mc_sims 1000 \
+  --mc_max_delay_days 3 --mc_delay_geom_p 0.5 \
+  --mc_partial_fill_max_days 2 \
+  --mc_miss_prob 0.01 \
+  --mc_drought_prob 0.005 --mc_drought_mean_days 3 \
+  --mc_fee_bps_in 4 --mc_fee_bps_out 4 --mc_spread_bps 2 \
+  --mc_slip_in_bps_mean 5 --mc_slip_out_bps_mean 5 \
+  --mc_slip_mult_bull 1.0 --mc_slip_mult_bear 1.3 --mc_slip_mult_choppy 1.15 \
+  --mc_vol_slip_k 50 \
+  --mc_ret_noise_sigma 0.001 \
+  --mc_shock_prob 0.01 --mc_shock_sigma 0.02 --mc_shock_mean_days 1 \
+  --mc_gap_weekend --mc_gap_sigma 0.01 \
+  --out_prefix rot_dual_mom_realisticMC_2019_2025
 """
 
-import argparse, math, warnings
+import argparse, math, warnings, sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -43,11 +55,14 @@ def _ensure_series_1d(x, index=None):
     if isinstance(x, pd.DataFrame):
         x = x.squeeze()
     if isinstance(x, pd.Series):
-        return pd.Series(np.asarray(x.values).reshape(-1), index=_to_utc_index(x.index))
-    arr = np.asarray(x).reshape(-1)
+        s = pd.Series(np.asarray(x.values).reshape(-1), index=_to_utc_index(x.index))
+        return s
+    arr = np.asarray(x)
+    if arr.ndim > 1:
+        raise ValueError(f"_ensure_series_1d expected 1-D, got {arr.ndim}-D with shape {arr.shape}")
     if index is None:
         raise ValueError("Index required when coercing raw array to Series.")
-    return pd.Series(arr, index=_to_utc_index(index))
+    return pd.Series(arr.reshape(-1), index=_to_utc_index(index))
 
 def drawdown(equity):
     peak = equity.cummax()
@@ -274,29 +289,61 @@ def build_positions(
 
     return pd.Series(pos, index=dates, name="target_pos")
 
-# -------------- Monte-Carlo --------------
-def simulate_mc(dates, pos_target, ret_btc, ret_paxg,
-                sims=1000, max_delay_days=3,
-                slip_in_bps_mean=5, slip_out_bps_mean=5,
-                slip_bps_std_frac=0.5,
-                ret_noise_sigma=0.001,
-                seed=42):
+# ---------------- Robust Monte-Carlo ----------------
+def _geom_delay(rng, p, max_days):
+    """Geometric delay sampled as number of extra days (0..max_days)."""
+    if p <= 0 or p > 1:
+        return 0
+    # Geometric on {1,2,...}; we want 0-based; cap at max_days
+    k = rng.geometric(p) - 1
+    return int(min(max_days, max(0, k)))
+
+def simulate_mc_robust(
+    dates,
+    pos_target,
+    ret_btc,
+    ret_paxg,
+    btc_atr_pct,
+    pax_atr_pct,
+    sims=1000,
+    max_delay_days=3,
+    delay_geom_p=0.5,
+    partial_fill_max_days=2,
+    miss_prob=0.0,
+    drought_prob=0.0,
+    drought_mean_days=3,
+    fee_bps_in=0.0,
+    fee_bps_out=0.0,
+    spread_bps=0.0,
+    slip_in_bps_mean=5.0,
+    slip_out_bps_mean=5.0,
+    slip_mult_bull=1.0,
+    slip_mult_bear=1.2,
+    slip_mult_choppy=1.1,
+    vol_slip_k=50.0,           # add (vol_slip_k * ATR%) bps to slips
+    ret_noise_sigma=0.0,
+    shock_prob=0.0,
+    shock_sigma=0.02,
+    shock_mean_days=1,
+    gap_weekend=False,
+    gap_sigma=0.0,
+    regimes_series=None,
+    seed=42
+):
     rng = np.random.default_rng(seed)
     dates = pd.DatetimeIndex(dates)
     N = len(dates)
 
-    rb = np.asarray(_ensure_series_1d(ret_btc, index=dates).reindex(dates).fillna(0.0).values).reshape(-1)
-    rp = np.asarray(_ensure_series_1d(ret_paxg, index=dates).reindex(dates).fillna(0.0).values).reshape(-1)
-
-    noise_btc  = rng.normal(0.0, ret_noise_sigma, size=(sims, N))
-    noise_paxg = rng.normal(0.0, ret_noise_sigma, size=(sims, N))
-
-    Rb = np.tile(rb[None, :], (sims, 1)) + noise_btc
-    Rp = np.tile(rp[None, :], (sims, 1)) + noise_paxg
+    # Core series (1-D aligned)
+    rb = _ensure_series_1d(ret_btc, index=dates).reindex(dates).fillna(0.0).values.reshape(-1)
+    rp = _ensure_series_1d(ret_paxg, index=dates).reindex(dates).fillna(0.0).values.reshape(-1)
+    atr_b = _ensure_series_1d(btc_atr_pct, index=dates).reindex(dates).fillna(0.0).values.reshape(-1)
+    atr_p = _ensure_series_1d(pax_atr_pct, index=dates).reindex(dates).fillna(0.0).values.reshape(-1)
 
     tgt = pos_target.reindex(dates).fillna("CASH").astype(str).values
+    regimes = regimes_series.reindex(dates).fillna("Choppy").astype(str).values if regimes_series is not None else np.array(["Choppy"]*N)
 
-    # switch indices for delay simulation
+    # Switch indices
     switch_idx = []
     prev = tgt[0]
     for i in range(1, N):
@@ -304,52 +351,172 @@ def simulate_mc(dates, pos_target, ret_btc, ret_paxg,
             switch_idx.append(i)
             prev = tgt[i]
 
+    # Helper: per-day slip multiplier by regime
+    reg_mult = np.ones(N, dtype=float)
+    for i in range(N):
+        r = regimes[i]
+        if r == "Bear":
+            reg_mult[i] = float(slip_mult_bear)
+        elif r == "Bull":
+            reg_mult[i] = float(slip_mult_bull)
+        else:
+            reg_mult[i] = float(slip_mult_choppy)
+
+    # Shock cluster flags (once for all sims; randomness per sim can be added by mixing seed if desired)
+    shock_flags = np.zeros(N, dtype=bool)
+    if shock_prob > 0 and shock_sigma > 0:
+        i = 0
+        while i < N:
+            if rng.random() < shock_prob:
+                dur = max(1, int(round(rng.poisson(lam=max(1e-6, shock_mean_days)))))
+                shock_flags[i:i+dur] = True
+                i += dur
+            else:
+                i += 1
+
+    # Weekend gap mask (Mondays)
+    is_monday = (pd.DatetimeIndex(dates).weekday == 0)
+
     equity_paths = np.empty((sims, N), dtype=float)
     trade_rows = []
 
     for s in range(sims):
+        rs = np.random.default_rng(seed + 101*s)
+
+        # Drought timer (days left where new entries are disallowed)
+        drought_left = 0
+
+        # Effective state array after delays/partial fills/missed trades
         eff = tgt.copy()
-        if max_delay_days > 0 and len(switch_idx) > 0:
-            rng_delays = np.random.default_rng(seed + 13*s)
-            delays = rng_delays.integers(0, max_delay_days+1, size=len(switch_idx))
+        # We’ll track “position scaling” 0..1 to model partial fills across days
+        scale = np.ones(N, dtype=float)
+
+        if len(switch_idx) > 0 and max_delay_days > 0:
+            # For each switch, possibly miss or delay, and maybe partial-fill
             for j, i_sw in enumerate(switch_idx):
-                d = int(delays[j])
+                # Miss trade?
+                if rs.random() < miss_prob:
+                    # Stay in previous state until the next switch (i.e., ignore this change)
+                    old_state = eff[i_sw-1]
+                    i_end = switch_idx[j+1] if (j+1 < len(switch_idx)) else N
+                    eff[i_sw:i_end] = old_state
+                    continue
+
+                # Delay days (geometric)
+                d = _geom_delay(rs, delay_geom_p, max_delay_days)
                 if d > 0:
                     new_state = eff[i_sw]
                     old_state = eff[i_sw-1]
                     i_end = min(N, i_sw + d)
                     eff[i_sw:i_end] = old_state
+                    # After delay, if we switch into BTC or PAXG, we might partially fill
+                    if new_state in ("BTC","PAXG") and partial_fill_max_days > 0:
+                        fill_days = min(partial_fill_max_days, N - i_end)
+                        if fill_days > 0:
+                            # Linear ramp  (1/fill_days, 2/fill_days, ..., 1.0)
+                            for k in range(fill_days):
+                                scale[i_end + k] = (k+1)/fill_days
 
+                else:
+                    # No delay; still can partial-fill if entering risk
+                    new_state = eff[i_sw]
+                    if new_state in ("BTC","PAXG") and partial_fill_max_days > 0:
+                        fill_days = min(partial_fill_max_days, N - i_sw)
+                        if fill_days > 0:
+                            for k in range(fill_days):
+                                scale[i_sw + k] = (k+1)/fill_days
+
+        # Apply droughts (disable new entries while drought_left>0)
+        # We implement it during the P&L loop by preventing transitions into BTC/PAXG.
         eq = 1.0
         path = np.zeros(N, dtype=float)
         cur_pos = "CASH"
+        cur_scale = 0.0
+
         for t in range(N):
-            pos = eff[t]
-            entry = (cur_pos != pos) and (pos in ("BTC","PAXG"))
-            exit_ = (cur_pos in ("BTC","PAXG")) and (pos != cur_pos)
+            # Start-of-day: maybe start a drought
+            if drought_left <= 0 and drought_prob > 0 and rs.random() < drought_prob:
+                drought_left = max(1, int(round(rs.poisson(lam=max(1e-6, drought_mean_days)))))
+            # Enforce drought on state transitions into risk
+            desired = eff[t]
+            desired_scale = scale[t]
+
+            if drought_left > 0:
+                # If trying to enter BTC/PAXG from CASH, block and remain CASH
+                if (cur_pos == "CASH") and (desired in ("BTC","PAXG")):
+                    desired = "CASH"
+                    desired_scale = 0.0
+                drought_left -= 1
+
+            # Apply transaction costs when state changes (entry/exit)
+            entry = (cur_pos != desired) and (desired in ("BTC","PAXG"))
+            exit_ = (cur_pos in ("BTC","PAXG")) and (desired != cur_pos)
+
+            # Fee + spread + slippage (regime + ATR%-scaled)
+            # Compute per-side slippage in decimal (not bps)
+            def slip_bps_for(side, t):
+                base = slip_in_bps_mean if side == "in" else slip_out_bps_mean
+                # ATR%-based bump: choose underlying ATR% based on desired or current
+                atr_pct = 0.0
+                if (side == "in" and desired == "BTC") or (side == "out" and cur_pos == "BTC"):
+                    atr_pct = atr_b[t]
+                elif (side == "in" and desired == "PAXG") or (side == "out" and cur_pos == "PAXG"):
+                    atr_pct = atr_p[t]
+                # regime multiplier
+                m = reg_mult[t]
+                # randomization around base (normal, pos-clipped)
+                rnd = max(0.0, rs.normal(base, base*0.5))
+                # add ATR%-linked bump
+                bump = vol_slip_k * max(0.0, float(atr_pct))  # in bps
+                total_bps = (rnd + bump) * m
+                # plus spread (half on entry, half on exit)
+                spread_half = (spread_bps * 0.5)
+                total_bps += spread_half
+                return total_bps
 
             if entry:
-                slip_in = max(0.0, np.random.normal(slip_in_bps_mean, slip_in_bps_mean*slip_bps_std_frac))/10000.0
-                eq *= (1.0 - slip_in)
-                trade_rows.append({"sim": s, "date": dates[t], "action": f"BUY_{pos}", "equity": eq})
+                # fees + slip
+                total_in_bps = fee_bps_in + slip_bps_for("in", t)
+                eq *= (1.0 - total_in_bps/10000.0)
+                trade_rows.append({"sim": s, "date": dates[t], "action": f"BUY_{desired}", "equity": eq})
             if exit_:
-                slip_out = max(0.0, np.random.normal(slip_out_bps_mean, slip_out_bps_mean*slip_bps_std_frac))/10000.0
-                eq *= (1.0 - slip_out)
+                total_out_bps = fee_bps_out + slip_bps_for("out", t)
+                eq *= (1.0 - total_out_bps/10000.0)
                 trade_rows.append({"sim": s, "date": dates[t], "action": f"EXIT_{cur_pos}", "equity": eq})
 
-            if pos == "BTC":
-                eq *= math.exp(Rb[s, t])
-            elif pos == "PAXG":
-                eq *= math.exp(Rp[s, t])
-            # CASH: no change
+            # Returns (base + noise + shocks + optional weekend gaps)
+            ret_bt = rb[t]
+            ret_px = rp[t]
+
+            # Base i.i.d. noise
+            if ret_noise_sigma > 0:
+                ret_bt += rs.normal(0.0, ret_noise_sigma)
+                ret_px += rs.normal(0.0, ret_noise_sigma)
+
+            # Shock cluster add-on
+            if shock_flags[t] and shock_sigma > 0:
+                ret_bt += rs.normal(0.0, shock_sigma)
+                ret_px += rs.normal(0.0, shock_sigma)
+
+            # Weekend gaps (apply only on Mondays to mimic Fri->Mon gap)
+            if gap_weekend and gap_sigma > 0 and is_monday[t]:
+                ret_bt += rs.normal(0.0, gap_sigma)
+                ret_px += rs.normal(0.0, gap_sigma)
+
+            # Apply position
+            if desired == "BTC":
+                eq *= math.exp(ret_bt * float(desired_scale))
+            elif desired == "PAXG":
+                eq *= math.exp(ret_px * float(desired_scale))
+            # CASH => no change
 
             path[t] = eq
-            cur_pos = pos
+            cur_pos = desired
+            cur_scale = desired_scale
 
         equity_paths[s, :] = path
 
     equity_wide = pd.DataFrame(equity_paths.T, index=dates, columns=[f"sim_{i}" for i in range(sims)])
-    # daily log-returns per simulation
     logrets = equity_wide.apply(lambda col: np.log(col/col.shift(1)).fillna(0.0))
     stats = []
     for i in range(sims):
@@ -475,35 +642,52 @@ def main():
     ap.add_argument("--dxy_ticker", default="DX=F")
     ap.add_argument("--dxy_ema_fast", type=int, default=10)
     ap.add_argument("--dxy_ema_slow", type=int, default=30)
-    ap.add_argument("--dxy_hold_days", type=int, default=0)  # 0 => ignore DXY (matches your good run)
+    ap.add_argument("--dxy_hold_days", type=int, default=0)  # 0 => ignore DXY
 
     # Bear gating: BTC weakness (absolute or relative if --bear_rel_mom)
-    ap.add_argument("--bear_mom_len", type=int, default=0, help="0=off; lookback L for BTC momentum or (BTC-PAXG) if --bear_rel_mom")
-    ap.add_argument("--bear_mom_thresh", type=float, default=0.0, help="BTC weakness threshold (<= means weak). For --bear_rel_mom this applies to BTC-PAXG.")
-    ap.add_argument("--bear_rel_mom", action="store_true", help="Use relative momentum (BTC minus PAXG) for the BTC weakness check.")
+    ap.add_argument("--bear_mom_len", type=int, default=0)
+    ap.add_argument("--bear_mom_thresh", type=float, default=0.0)
+    ap.add_argument("--bear_rel_mom", action="store_true")
 
     # PAXG strength gate
-    ap.add_argument("--paxg_mom_len", type=int, default=0, help="0=off; lookback L for PAXG momentum (>= means strong).")
-    ap.add_argument("--paxg_mom_thresh", type=float, default=0.0, help="PAXG strength threshold (>= means strong).")
+    ap.add_argument("--paxg_mom_len", type=int, default=0)
+    ap.add_argument("--paxg_mom_thresh", type=float, default=0.0)
 
     # Trailing stop controls
-    ap.add_argument("--paxg_trailing_stop", action="store_true", help="Enable PAXG trailing stop during Bear.")
-    ap.add_argument("--paxg_trail_atr_len", type=int, default=14, help="ATR length for trailing stop.")
-    ap.add_argument("--paxg_trail_k", type=float, default=2.5, help="Stop = highest close since entry minus k*ATR (your tighttrail default).")
+    ap.add_argument("--paxg_trailing_stop", action="store_true")
+    ap.add_argument("--paxg_trail_atr_len", type=int, default=14)
+    ap.add_argument("--paxg_trail_k", type=float, default=2.5)
 
-    # NEW: stop confirmation + re-entry policy
-    ap.add_argument("--stop_confirm_days", type=int, default=1, help="Require N consecutive closes below trail to stop (1 = same-day).")
-    ap.add_argument("--reenter_mode", choices=["cooldown","newhigh"], default="cooldown",
-                    help="Re-entry policy after stop-out: 'cooldown' (fixed wait) or 'newhigh' (break prior anchor high).")
-    ap.add_argument("--paxg_reenter_cooldown", type=int, default=7, help="Days to wait after stop-out if reenter_mode=cooldown.")
-    ap.add_argument("--reenter_eps", type=float, default=0.003, help="New-high buffer for reenter_mode=newhigh (e.g., 0.003 = +0.3%).")
+    # Stop confirmation + re-entry policy
+    ap.add_argument("--stop_confirm_days", type=int, default=1)
+    ap.add_argument("--reenter_mode", choices=["cooldown","newhigh"], default="cooldown")
+    ap.add_argument("--paxg_reenter_cooldown", type=int, default=7)
+    ap.add_argument("--reenter_eps", type=float, default=0.003)
 
-    # Monte-Carlo
+    # Robust Monte-Carlo flags
     ap.add_argument("--mc_sims", type=int, default=500)
     ap.add_argument("--mc_max_delay_days", type=int, default=3)
+    ap.add_argument("--mc_delay_geom_p", type=float, default=0.5)
+    ap.add_argument("--mc_partial_fill_max_days", type=int, default=2)
+    ap.add_argument("--mc_miss_prob", type=float, default=0.0)
+    ap.add_argument("--mc_drought_prob", type=float, default=0.0)
+    ap.add_argument("--mc_drought_mean_days", type=float, default=3.0)
+    ap.add_argument("--mc_fee_bps_in", type=float, default=0.0)
+    ap.add_argument("--mc_fee_bps_out", type=float, default=0.0)
+    ap.add_argument("--mc_spread_bps", type=float, default=0.0)
     ap.add_argument("--mc_slip_in_bps_mean", type=float, default=5.0)
     ap.add_argument("--mc_slip_out_bps_mean", type=float, default=5.0)
-    ap.add_argument("--mc_ret_noise_sigma", type=float, default=0.001)
+    ap.add_argument("--mc_slip_mult_bull", type=float, default=1.0)
+    ap.add_argument("--mc_slip_mult_bear", type=float, default=1.3)
+    ap.add_argument("--mc_slip_mult_choppy", type=float, default=1.15)
+    ap.add_argument("--mc_vol_slip_k", type=float, default=50.0)
+    ap.add_argument("--mc_ret_noise_sigma", type=float, default=0.0)
+    ap.add_argument("--mc_shock_prob", type=float, default=0.0)
+    ap.add_argument("--mc_shock_sigma", type=float, default=0.02)
+    ap.add_argument("--mc_shock_mean_days", type=float, default=1.0)
+    ap.add_argument("--mc_gap_weekend", action="store_true")
+    ap.add_argument("--mc_gap_sigma", type=float, default=0.0)
+
     ap.add_argument("--out_prefix", required=True)
     args = ap.parse_args()
 
@@ -559,6 +743,7 @@ def main():
     if args.paxg_trailing_stop:
         pax_atr = atr_from_ohlc(pax, n=int(args.paxg_trail_atr_len)).reindex(dates).ffill()
 
+    # DXY confirm
     dxy_close = _ensure_series_1d(dxy["close"].reindex(dates).ffill(), index=dates)
     up_flag, down_flag = dxy_confirm(dxy_close,
                                      ema_fast=args.dxy_ema_fast,
@@ -582,14 +767,44 @@ def main():
         reenter_eps=float(args.reenter_eps)
     )
 
-    # Monte-Carlo
-    summary_df, equity_wide, sim_logrets, trade_log = simulate_mc(
-        dates, pos_target, r_btc, r_pax,
+    # Realized vol (ATR %) for slippage realism
+    atr_len = 14
+    btc_atr = atr_from_ohlc(btc, n=atr_len).reindex(dates).ffill()
+    pax_atr = atr_from_ohlc(pax, n=atr_len).reindex(dates).ffill()
+    btc_atr_pct = (btc_atr / btc_close).fillna(0.0)
+    pax_atr_pct = (pax_atr / pax_close).fillna(0.0)
+
+    # Robust Monte-Carlo
+    summary_df, equity_wide, sim_logrets, trade_log = simulate_mc_robust(
+        dates=dates,
+        pos_target=pos_target,
+        ret_btc=r_btc,
+        ret_paxg=r_pax,
+        btc_atr_pct=btc_atr_pct,
+        pax_atr_pct=pax_atr_pct,
         sims=args.mc_sims,
         max_delay_days=args.mc_max_delay_days,
+        delay_geom_p=args.mc_delay_geom_p,
+        partial_fill_max_days=args.mc_partial_fill_max_days,
+        miss_prob=args.mc_miss_prob,
+        drought_prob=args.mc_drought_prob,
+        drought_mean_days=args.mc_drought_mean_days,
+        fee_bps_in=args.mc_fee_bps_in,
+        fee_bps_out=args.mc_fee_bps_out,
+        spread_bps=args.mc_spread_bps,
         slip_in_bps_mean=args.mc_slip_in_bps_mean,
         slip_out_bps_mean=args.mc_slip_out_bps_mean,
+        slip_mult_bull=args.mc_slip_mult_bull,
+        slip_mult_bear=args.mc_slip_mult_bear,
+        slip_mult_choppy=args.mc_slip_mult_choppy,
+        vol_slip_k=args.mc_vol_slip_k,
         ret_noise_sigma=args.mc_ret_noise_sigma,
+        shock_prob=args.mc_shock_prob,
+        shock_sigma=args.mc_shock_sigma,
+        shock_mean_days=args.mc_shock_mean_days,
+        gap_weekend=args.mc_gap_weekend,
+        gap_sigma=args.mc_gap_sigma,
+        regimes_series=regimes_series,
         seed=42
     )
 
@@ -637,4 +852,8 @@ def main():
     print(f"  {pref}_bear_windows_summary.csv")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("ERROR:", e, file=sys.stderr)
+        raise
