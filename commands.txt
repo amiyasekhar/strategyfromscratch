@@ -1,4 +1,4 @@
-python3 test.py \
+python3 paxg_rotation_mc.py \
   --regimes_csv btc_usd_regimes_2014train_2019plus_test.csv \
   --start 2019-01-01 --end 2025-12-31 \
   --dxy_hold_days 0 \
@@ -19,3 +19,18 @@ python3 test.py \
   --mc_shock_prob 0.01 --mc_shock_sigma 0.02 --mc_shock_mean_days 1 \
   --mc_gap_weekend --mc_gap_sigma 0.01 \
   --out_prefix rot_dual_mom_realisticMC_2019_2025
+
+
+____
+
+python3 hybrid_allinone.py \
+  --symbol BTC-USD \
+  --start 2014-01-01 \
+  --macro_win 90 \
+  --micro_win 30
+  
+python3 test_bear_modes_binance_nav_mc.py \
+  --hybrid_csv hybrid_out.csv \
+  --start 2019-01-01 --end 2025-12-31 \
+  --inverse_etf_ticker BITI \
+  --out_prefix rot_hybrid_BEARetf_guardedMC_BplusC_2019_2025
